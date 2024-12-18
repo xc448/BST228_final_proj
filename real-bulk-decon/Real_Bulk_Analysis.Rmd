@@ -1,0 +1,657 @@
+---
+title: "Bulk-RNAseq"
+author: "Ting Zhai"
+date: "2024-12-12"
+output: html_document
+---
+
+For this group project, we use bulk RNA-seq data from GEO: GSE174367, to provide real-world application of our deconvolution approach. 
+
+# Bulk data - initial inspection
+
+## Read in bulk data 
+
+```{r}
+load("~/Downloads/GSE174367_bulkRNA_processed.rda")
+
+str(normExpr.reg)
+str(targets)
+
+class(targets)
+
+# assign gene names
+library(biomaRt)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+genes <- rownames(normExpr.reg)
+gene_info <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), filters = "ensembl_gene_id", values = genes, mart = ensembl)
+
+normExpr.reg$hugo_name <- gene_info$hgnc_symbol[match(rownames(normExpr.reg), gene_info$ensembl_gene_id)]
+
+# Check for missing HUGO names
+sum(is.na(normExpr.reg$hugo_name) | normExpr.reg$hugo_name == "")
+# Check for duplicates in HUGO names
+duplicated_hugo <- normExpr.reg$hugo_name[duplicated(normExpr.reg$hugo_name)]
+print(duplicated_hugo)  # List of duplicate HUGO names
+# clean up the expression matrix
+normExpr.reg$hugo_name[normExpr.reg$hugo_name == "" | is.na(normExpr.reg$hugo_name)] <- rownames(normExpr.reg)
+```
+
+## Umap visualization 
+
+```{r}
+load("./data/GSE174367_bulkRNA_processed.rda")
+sum(is.na(normExpr.reg))
+norm_counts_t <- t(normExpr.reg)
+# Load libraries
+library(umap)
+library(ggplot2)
+
+# Perform UMAP
+umap_result <- umap(norm_counts_t)
+
+# Create a dataframe for plotting
+umap_df <- data.frame(UMAP1 = umap_result$layout[, 1],
+                      UMAP2 = umap_result$layout[, 2],
+                      Condition = targets$Diagnosis)  # Replace with your group variable
+
+# UMAP Plot
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2, fill = Condition)) +
+  geom_point(size = 3.6, alpha = 0.6, shape=21) + scale_fill_viridis(discrete = TRUE, option="C") +
+  labs(title = "",
+       x = "UMAP 1",
+       y = "UMAP 2") +
+  theme_classic() 
+```
+
+
+# Data pre-processing 
+
+First we need to clean up the data and prepare it for the deconvolution analysis. This includes assign gene names to replace Ensembl IDs, remove missing or empty gene names, and subset the data to include only the genes present in the reference columns. For the deconvolution, we will also split the data into case and control groups, to improve the accuracy of the deconvolution analysis.
+
+```{r preprocessing}
+# set work directory 
+setwd("~/Documents/R_working/bst228")
+
+# Load necessary libraries
+library(biomaRt)
+
+# Load bulk data
+load("./data/GSE174367_bulkRNA_processed.rda")
+
+# Inspect the structure of loaded objects
+str(normExpr.reg)
+str(targets)
+class(targets)
+
+# Set up Ensembl biomart connection to get gene annotations
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+genes <- rownames(normExpr.reg)
+gene_info <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol"), 
+                   filters = "ensembl_gene_id", 
+                   values = genes, 
+                   mart = ensembl)
+
+# Add HUGO gene symbols to normExpr.reg
+normExpr.reg$hugo_name <- gene_info$hgnc_symbol[match(rownames(normExpr.reg), gene_info$ensembl_gene_id)]
+
+# Replace missing or empty HUGO symbols with their Ensembl IDs
+missing_hugo <- is.na(normExpr.reg$hugo_name) | normExpr.reg$hugo_name == ""
+normExpr.reg$hugo_name[missing_hugo] <- rownames(normExpr.reg)[missing_hugo]
+
+# (Optional) Check for duplicates in HUGO names, just to be aware
+duplicated_hugo <- normExpr.reg$hugo_name[duplicated(normExpr.reg$hugo_name)]
+if (length(duplicated_hugo) > 0) {
+  message("Warning: There are duplicated HUGO names.")
+  print(duplicated_hugo)
+  # Consider how to handle duplicates if necessary (e.g., aggregating counts)
+}
+
+# Load the reference file
+ref <- read.csv("./data/reference.csv", row.names = 1)
+# list of reference ids
+ad_ids <- c("AD00802", "AD00803", "AD01103", "AD01303", 
+               "AD01304", "AD04902", "AD04904", "AD05701", "AD06302")
+control_ids <- c("AD00801", "AD01101", "AD01102", "AD01301", "AD03203", 
+                 "AD04901", "AD04903", "AD05703", "AD05704", "AD06301")
+
+# Subset bulk data (Exp) to include only the genes present in the reference columns
+Exp <- normExpr.reg[normExpr.reg$hugo_name %in% colnames(ref), ]
+rownames(Exp) <- Exp$hugo_name
+Exp <- Exp[ , -ncol(Exp)]  # remove the hugo_name column
+Exp <- round(as.matrix(Exp))
+Exp[Exp < 0] <- 0
+
+# Subset ref data to include only genes present in Exp
+ref <- ref[ , rownames(Exp)]
+
+## at this point, save cleaned data for future use 
+saveRDS(Exp, file = "./data/Exp_cleaned.rds")
+saveRDS(ref, file = "./data/ref_cleaned.rds")
+saveRDS(targets, file = "./data/targets.rds")
+
+## save case and control specific data to directly call in the deconvolution script
+Exp_case <- Exp[ , targets$SampleID[targets$Diagnosis == "AD"]]
+Exp_control <- Exp[ , targets$SampleID[targets$Diagnosis == "Control"]]
+ref_case <- ref[grepl(paste0("_(", paste(ad_ids, collapse = "|"), ")$"), rownames(ref)), ]
+ref_control <- ref[grepl(paste0("_(", paste(control_ids, collapse = "|"), ")$"), rownames(ref)), ]
+
+saveRDS(Exp_case, file = "./data/Exp_case.rds")
+saveRDS(Exp_control, file = "./data/Exp_control.rds")
+saveRDS(ref_case, file = "./data/ref_case.rds")
+saveRDS(ref_control, file = "./data/ref_control.rds")
+```
+
+
+# Deconvolution of real bulk
+
+```{bash terminal, eval=FALSE}
+# This script trunk should be run in terminal to fully utilize the parallel processing capabilities of the Gibbs sampler as defined in the source script.
+
+# Runtime on a local machine may vary depending on the number of cores available: 10 cores 20 GB RAM give around 3 hours for each. 
+
+# Run the deconvolution script for case samples
+./scripts/decon_case.R
+
+# Run the deconvolution script for control samples
+./scripts/decon_control.R 
+```
+
+
+# Post-processing analysis 
+
+```{r}
+# Load the output from the Gibbs sampler
+res_case <- readRDS("./output/bulk_case_output.rds")
+res_control <- readRDS("./output/bulk_control_output.rds")
+Exp = readRDS("./data/Exp_cleaned.rds")
+ref = readRDS("./data/ref_cleaned.rds")
+Exp_case = readRDS("./data/Exp_case.rds")
+Exp_control = readRDS("./data/Exp_control.rds")
+```
+
+
+## MCMC diagnostics 
+
+```{r}
+source("./scripts/diagnostics.R") # Load the diagnostics functions
+
+# Get MCMC diagnostic metrics (rhat, ess) for the case and control samples
+diagnostics_case <- mcmc_diagnostics_metrics(res_case$theta_n, res_case$theta_n_samples, threshold = 1e-8)
+
+diagnostics_control <- mcmc_diagnostics_metrics(res_control$theta_n, res_control$theta_n_samples, threshold = 1e-8)
+
+# Summarize the diagnostics
+ hist(sapply(diagnostics_case, function(x) x$rhat))
+ summary(sapply(diagnostics_case, function(x) x$effective_size))
+head(diagnostics_case)
+head(diagnostics_control)
+
+# Plot the MCMC diagnostics for a specific sample and cell type
+plot_mcmc_diagnostics(res = res_case,  
+                      sample_name = "Sample-26", 
+                      cell_type_name = "Astrocytes_AD00803",
+                      sample_names = colnames(Exp_case),
+                      cell_type_names = rownames(ref_case))
+
+# Plot the diagnostics metrics obtained earlier 
+dense_df <- data.frame(rhat = sapply(diagnostics_case, function(x) x$rhat),
+                       ess = sapply(diagnostics_case, function(x) x$effective_size))
+
+p<- ggplot(dense_df, aes(x = effective_size)) + 
+  geom_density(fill = "lightblue", color = "grey", alpha = 0.5) + 
+  xlab("Effective sample size") + ylab("Density") + theme_minimal()
+ggsave("./output/ess_density.png", plot = p, width = 4, height = 2, units = "in")
+
+p<- ggplot(dense_df, aes(x = rhat)) + 
+  geom_density(fill = "lightblue", color = "grey", alpha = 0.5) + 
+  xlab("Rhat") + ylab("Density") + theme_minimal()
+ggsave("./output/rhat_density.png", plot = p, width = 4, height = 2, units = "in")
+
+```
+
+
+## Proportion calculation 
+
+```{r}
+# obtain cell type proportions from deconvolution results
+prop_case <- as.data.frame(res_case$theta_n)
+prop_control <- as.data.frame(res_control$theta_n)
+
+# Combine case and control data
+prop_all <- bind_rows(process_sample_proportions(prop_case) 
+                     , process_sample_proportions(prop_control)
+                   )
+# Calculate summed proportions for each cell type across references, grouped by sample
+n_chains = 5
+
+prop_summed <- prop_all %>%
+  group_by(sample, cell_type) %>%
+  summarise(total_proportion = sum(proportion, na.rm = TRUE)/n_chains, .groups = "drop") %>% 
+  pivot_wider(names_from = cell_type, values_from = total_proportion)
+
+# View the processed proportions
+head(prop_summed)
+
+# merge with patient data
+dat <- targets %>% 
+  select(SampleID, Neuropath.Dx.1, Age, Sex, PMI, APoE, Tangle.Stage, Diagnosis, Clinical.Syndrome) %>%
+  left_join(prop_summed, by = c("SampleID" = "sample"))
+```
+
+
+## Visualization 
+
+```{r}
+library(ggplot2)
+library(viridis)
+# Plot the celltype proportion variability by reference
+ggplot(prop_all, aes(x = cell_type, y = proportion, fill = reference)) +
+  geom_bar(stat = "identity") + scale_fill_viridis(discrete = TRUE) +
+  labs(
+    title = "Stacked Bar Plot of Reference Contribution by Cell Type",
+    x = "Cell Type",
+    y = "Proportion",
+    fill = "Reference"
+  ) +
+  theme_minimal()
+
+ggplot(prop_all, aes(x = cell_type, y = proportion, fill = reference)) +
+  geom_bar(stat = "identity") + scale_fill_viridis(discrete = TRUE) +
+  labs(title = "Stacked Bar Plot of Reference Contribution by Cell Type",
+       x = "",
+       y = "Deconvoluted Proportion") +
+  theme(
+    legend.text = element_text(size = 8),       # Shrink legend text size
+    legend.title = element_text(size = 10),     # Shrink legend title size
+    legend.key.size = unit(0.3, "cm"),          # Reduce legend key size
+    legend.spacing.y = unit(0.1, "cm")          # Add spacing between legend items
+  ) +
+  guides(fill = guide_legend(byrow = TRUE)) 
+```
+
+
+```{r}
+# make long format for plotting
+dat_long <- dat %>% 
+  pivot_longer(cols = c(Astrocytes, `Excitatory neurons`, `Inhibitory neurons`), names_to = "CellType", values_to = "Proportion")
+# cell type by case vs control in patient dat
+ggplot(dat_long, aes(x = CellType, y = Proportion, color = Diagnosis)) +
+  geom_jitter(alpha=0.6) + scale_color_viridis(discrete = TRUE) +
+  labs(
+    title = "Cell Proportions by Diagnosis",
+    x = "Cell Type",
+    y = "Deconvoluted Proportion",
+    color = "Diagnosis"
+  ) +
+  theme_minimal()
+ggplot(dat_long, aes(x = Diagnosis, y = Proportion, color = Diagnosis, fill = Diagnosis)) + scale_fill_viridis(discrete = TRUE) + scale_color_viridis(discrete = TRUE) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(alpha = 0.6, size = 1.5, width = 0.2) +
+  facet_wrap(~CellType) +
+    labs(
+    title = "Cell Proportions by Diagnosis",
+    x = "",
+    y = "Deconvoluted Proportion",
+    color = "Diagnosis"
+  )+  theme_minimal() + theme(legend.position = "none")
+```
+
+
+```{r DISCARD - efforts to make umap in bulk data}
+all(dimnames(Z_case_mean)[[1]] == dimnames(Z_control_mean)[[1]])
+genes <- dimnames(Z_case_mean)[[1]]
+# Combine cell types
+cell_types_case <- dimnames(Z_case_mean)[[2]]
+cell_types_control <- dimnames(Z_control_mean)[[2]]
+
+combined_cell_types <- c(cell_types_case, cell_types_control)
+
+# Combine samples
+samples_case <- dimnames(Z_case_mean)[[3]]
+samples_control <- dimnames(Z_control_mean)[[3]]
+
+combined_samples <- c(samples_case, samples_control)
+
+# Initialize the combined array: Genes x Combined Cell Types x Combined Samples
+combined_array <- array(NA, dim = c(length(genes), length(combined_cell_types), length(combined_samples)),
+                        dimnames = list(genes, combined_cell_types, combined_samples))
+
+# Fill in the combined array
+# 1. Insert Z_case_mean
+combined_array[, cell_types_case, samples_case] <- Z_case_mean
+
+# 2. Insert Z_control_mean
+combined_array[, cell_types_control, samples_control] <- Z_control_mean
+
+# Check the dimensions of the combined array
+dim(combined_array)
+
+# View the combined array structure
+str(combined_array)
+
+# TRIED to do umap on the gene expression matrix but the UMAP was too weird, possibly due to the expression selective to cell types. 
+Z_mean = combined_array
+
+# Assuming Z_mean is a 3D array: Genes x CellTypes x Samples
+
+# Step 1: Extract dimension names
+genes <- dimnames(Z_mean)[[1]]        # Gene names
+cell_types <- dimnames(Z_mean)[[2]]   # Cell type names
+samples <- dimnames(Z_mean)[[3]]      # Sample names
+
+# Step 2: Create combined "Sample_CellType" row identifiers
+row_ids <- as.vector(outer(samples, cell_types, paste, sep = "_"))  # "Sample_CellType"
+
+# Step 3: Initialize a matrix for the reshaped data
+Z_flat <- matrix(NA, nrow = length(row_ids), ncol = length(genes))  # Initialize matrix
+rownames(Z_flat) <- row_ids  # Assign row names (Sample_CellType)
+colnames(Z_flat) <- genes     # Assign column names (genes)
+
+# Step 4: Fill the flattened matrix
+row_idx <- 1
+for (sample in samples) {
+  for (cell_type in cell_types) {
+    Z_flat[row_idx, ] <- Z_mean[, cell_type, sample]
+    row_idx <- row_idx + 1
+  }
+}
+
+# Check the reshaped matrix
+dim(Z_flat)  # Rows = Sample_CellType, Columns = Genes
+colnames(Z_flat)[1:10]
+# Step 1: Remove NAs and zeros
+Z_flat_clean <- Z_flat  # Make a copy to keep the original intact
+
+# Replace NAs and zeros with NA
+Z_flat_clean[Z_flat_clean == 0] <- NA  # Treat 0 as missing
+Z_flat_clean <- Z_flat_clean[rowSums(is.na(Z_flat_clean)) < ncol(Z_flat_clean), ]  # Drop rows with all NA
+Z_flat_clean <- Z_flat_clean[, colSums(is.na(Z_flat_clean)) < nrow(Z_flat_clean)]  # Drop columns with all NA
+
+# Replace remaining NAs with row or column means
+Z_flat_clean[is.na(Z_flat_clean)] <- 0  # Replace NA with zero or use row/col means if needed
+dim(Z_flat_clean)
+Z_flat_clean <- scale(Z_flat_clean)  # Standardize the data
+# Step 2: Calculate variance for genes (columns) and filter top 5000 genes
+gene_variance <- apply(Z_flat_clean, 2, var, na.rm = TRUE)  # Variance for each gene
+gene_variance <- sort(gene_variance, decreasing = TRUE)     # Sort by decreasing variance
+
+top_5000_genes <- names(gene_variance[1:5000])  # Select top 5000 genes
+Z_top_genes <- Z_flat_clean[, top_5000_genes, drop = FALSE]  # Subset the matrix
+
+# Step 3: Calculate variance for samples (rows) and filter top 1000 samples
+sample_variance <- apply(Z_top_genes, 1, var, na.rm = TRUE)  # Variance for each sample
+sample_variance <- sort(sample_variance, decreasing = TRUE)  # Sort by decreasing variance
+
+top_1000_samples <- names(sample_variance[1:1000])  # Select top 1000 samples
+Z_top <- Z_top_genes[top_1000_samples, , drop = FALSE]  # Subset the matrix
+
+# Step 4: Check the final dimensions
+dim(Z_top)  # Should be 1000 rows (samples) and 5000 columns (genes)
+
+# View a preview of the cleaned and filtered data
+head(Z_top)
+
+pca_result <- prcomp(Z_flat_clean, center = TRUE, scale. = TRUE)
+
+# Step 3: Select the top 50 principal components
+pca_top <- pca_result$x[, 1:50]  # Take the first 50 PCs
+
+library(umap)
+library(ggplot2)
+umap_config <- umap.defaults
+umap_config$n_neighbors <- 30  # Increase neighborhood size
+umap_config$min_dist <- 0.2   
+# Run UMAP on Z_flat
+umap_result <- umap(pca_top)
+
+# Prepare data for plotting
+umap_df <- data.frame(
+  UMAP1 = umap_result$layout[, 1],
+  UMAP2 = umap_result$layout[, 2]
+)
+
+# Plot UMAP
+ggplot(umap_df, aes(x = UMAP1, y = UMAP2)) +
+  geom_point(size = 0.5) +
+ # geom_text(size = 2, vjust = 1.5) +
+  labs(title = "UMAP of Sample-CellType Gene Expression", x = "UMAP1", y = "UMAP2") +
+  theme_minimal()
+```
+
+
+## Risk prediction 
+
+```{r}
+# use dat obtained from merging cell props with patient data
+
+# explore if cell type proportions differ by diagnosis
+summary( glm (Astrocytes ~ Diagnosis + Age + Sex + PMI  , data = dat))
+summary( glm (`Excitatory neurons` ~ Diagnosis + Age + Sex+ PMI, data = dat))
+summary( glm (`Inhibitory neurons` ~ Diagnosis + Age + Sex+ PMI , data = dat))
+
+# create finer categories for later modeling
+dat$APOE_Risk <- factor(
+  ifelse(dat$APoE %in% c("e43", "e42", "e44"), "High Risk", 
+         ifelse(dat$APoE %in% c("e33", "e32"), "Low Risk", NA)))
+dat$APOE_Risk <- factor(dat$APOE_Risk, levels = c("Low Risk", "High Risk"))
+
+dat$Diagnosis <- ifelse(dat$Diagnosis == "AD", 1, 0)
+dat$Diagnosis <- as.factor(dat$Diagnosis)
+
+# remove rows with missing values in relevant columns and select columns for modeling
+dat_clean <- na.omit(dat[, c("Diagnosis", "Astrocytes", "Excitatory neurons", "PMI", "Age", "Sex", "APOE_Risk")])
+
+```
+
+
+```{r}
+# run risk prediction model and obtain performance evaluation metrics
+
+# Model 1: Crude without adjustment for covariates
+mod1 <- glm(Diagnosis ~ APOE_Risk, 
+                      data = dat_clean, family = "binomial")
+
+# Model 2: Adjusted for patient characteristics
+mod2 <- glm(Diagnosis ~ Age + Sex + APOE_Risk, 
+                      data = dat_clean, family = "binomial")
+
+# Model 3: Unadjusted (excludes Astrocytes and Excitatory neurons)
+mod3 <- glm(Diagnosis ~ Age + Sex + APOE_Risk + Astrocytes + `Excitatory neurons`, 
+                        data = dat_clean, family = "binomial")
+
+# Predicted probabilities
+dat_clean$pred1 <- predict(mod1, type = "response")
+dat_clean$pred2 <- predict(mod2, type = "response")
+dat_clean$pred3 <- predict(mod3, type = "response")
+
+library(pROC)
+
+roc1 <- roc(dat_clean$Diagnosis, dat_clean$pred1)
+auc1 <- auc(roc1)
+# ROC curve and AUC for the adjusted model
+roc2 <- roc(dat_clean$Diagnosis, dat_clean$pred2)
+auc2 <- auc(roc2)
+
+# ROC curve and AUC for the unadjusted model
+roc3 <- roc(dat_clean$Diagnosis, dat_clean$pred3)
+auc3 <- auc(roc3)
+
+# Print AUC values
+print(paste("AUC for model 1:", round(auc1, 3)))
+print(paste("AUC for model 2:", round(auc2, 3)))
+print(paste("AUC for model 3:", round(auc3, 3)))
+      
+# Plot ROC curves
+plot(roc1, col = "blue", main = "ROC Curves for Risk Prediction Models")
+plot(roc2, col = "red", add = TRUE)
+plot(roc3, col = "green", add = TRUE)
+legend("bottomright", legend = c("1", "2", "3"), col = c("blue", "red", "green"), lty = 1)
+
+```
+
+
+## Gene expression signature 
+
+```{r}
+# Load the output from the Gibbs sampler
+res_case <- readRDS("./output/bulk_case_output.rds")
+res_control <- readRDS("./output/bulk_control_output.rds")
+
+# Obtain the mean gene expression values for each cell type
+Z_case_mean <- apply(res_case$Z_n, c(1, 2, 3), mean)
+Z_control_mean <- apply(res_control$Z_n, c(1, 2, 3), mean)
+
+# Define patterns to search for
+cell_type_patterns <- c("Astrocytes", "Excitatory neurons", "Inhibitory neurons")
+# Apply the aggregation function from helper_functions.R
+Z_case_agg <- aggregate_by_prefix(Z_case_mean, cell_type_patterns)
+Z_control_agg <- aggregate_by_prefix(Z_control_mean, cell_type_patterns)
+
+# Reshape aggregated Z_agg into a unified long-format data frame
+library(reshape2)
+Z_df_agg <- do.call(rbind, lapply(names(Z_agg), function(cell_type) {
+  data.frame(
+    Gene = rep(rownames(Z_agg[[cell_type]]), ncol(Z_agg[[cell_type]])),
+    Sample = rep(colnames(Z_agg[[cell_type]]), each = nrow(Z_agg[[cell_type]])),
+    CellType = cell_type,
+    Expression = as.vector(Z_agg[[cell_type]])
+  )
+}))
+Z_df_agg_case <- reshape_expression_list(Z_case_agg)
+Z_df_agg_control <- reshape_expression_list(Z_control_agg)
+Z_df_agg <- rbind(Z_df_agg_case, Z_df_agg_control)
+# Inspect the reshaped data
+tail(Z_df_agg)
+
+## use previously calculated proportions
+proportions_df = prop_summed
+colnames(proportions_df)[1] <- "Sample"
+# Convert proportions data frame to long format
+proportions_long <- proportions_df %>%
+  pivot_longer(cols = -Sample, names_to = "CellType", values_to = "Proportion")
+
+# Merge aggregated gene expression with pre-calculated proportions
+combined_data <- merge(Z_df_agg, proportions_long, by = c("Sample", "CellType"))
+
+# Inspect combined data
+head(combined_data)
+```
+
+
+```{r}
+# Gene expression signature of AD-associated genes
+library(dplyr)
+
+# Option 1: Define a list of AD-associated genes
+ad_genes <- c("APOE", "TREM2", "MAPT", "BIN1", "CLU", "GFAP", "CD33")
+
+# Option 2: Load a pre-defined gene set from an external source
+library(msigdbr)
+library(dplyr)
+library(psych)
+
+# Retrieve KEGG gene sets for humans
+kegg_human <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG")
+
+# Filter for Alzheimer’s disease pathway
+ad_kegg <- kegg_human %>% filter(gs_name == "KEGG_ALZHEIMERS_DISEASE")
+
+# Filter for AD genes and compute correlations
+# Filter the combined data for AD-related genes
+ad_data <- combined_data %>% filter(Gene %in% ad_kegg$gene_symbol)
+
+# Summarize average expression of AD gene signatures per sample and cell type
+ad_signature_scores <- ad_data %>%
+  group_by(Sample, CellType) %>%
+  summarize(SignatureExpression = mean(Expression, na.rm = TRUE)) %>%
+  merge(dat, by.x = "Sample", by.y="SampleID")
+
+# Merge signature scores with cell-type proportions
+merged_data <- merge(ad_signature_scores, proportions_long, by = c("Sample", "CellType"))
+
+# Compute correlation between proportions and AD signature expression
+cor_results <- merged_data %>%
+  group_by(CellType) %>%
+  summarize(
+    Correlation = cor(Proportion, SignatureExpression, method = "pearson", use = "complete.obs"),
+    p_value = corr.test(Proportion, SignatureExpression)$p.adj
+  )
+
+# Print correlation results
+print(cor_results)
+
+library(ggplot2)
+library(viridis)
+
+# Scatter plot for each cell type
+p<-ggplot(ad_signature_scores %>% filter(CellType == "Astrocytes"), aes(x = Astrocytes, y = SignatureExpression, color = SignatureExpression)) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey", alpha=0.25) +
+  geom_point(size = 2, alpha=0.6) + scale_color_viridis() +
+    annotate("text", x = 0.5, 
+           y = 4.7, 
+           label = paste0("Pearson's r = 0.74"),
+           hjust = 0, vjust = 1, size = 4, color = "black") +
+  ggtitle("Astrocytes") +
+  xlab("Deconvoluted Proportion") +
+  ylab("AD Signature Expression") +
+  theme_minimal() + theme(legend.position = "none")
+ggsave("./output/astrocytes_scatter.png", plot = p, width = 3, height = 4, dpi = 300)
+
+
+p<-ggplot(ad_signature_scores %>% filter(CellType == "Excitatory neurons"), aes(x = `Excitatory neurons`, y = SignatureExpression, color = SignatureExpression)) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey", alpha=0.25) +
+  geom_point(size = 2, alpha=0.6) + scale_color_viridis() +
+    annotate("text", x = 0.14, 
+           y = 1.75, 
+           label = paste0("Pearson's r = 0.96"),
+           hjust = 0, vjust = 1, size = 4, color = "black") +
+  ggtitle("Excitatory neurons") +
+  xlab("Deconvoluted Proportion") +
+  ylab("AD Signature Expression") +
+  theme_minimal() + theme(legend.position = "none")
+ggsave("./output/ex_scatter.png", plot = p, width = 3, height = 4, dpi = 300)
+
+p<-ggplot(ad_signature_scores %>% filter(CellType == "Inhibitory neurons"), aes(x = `Inhibitory neurons`, y = SignatureExpression, color = SignatureExpression)) +
+  geom_smooth(method = "lm", se = TRUE, color = "grey", alpha=0.25) +
+  geom_point(size = 2, alpha=0.6) + scale_color_viridis() +
+    annotate("text", x = 0.23, 
+           y = 2.6, 
+           label = paste0("Pearson's r = 0.82"),
+           hjust = 0, vjust = 1, size = 4, color = "black") +
+  ggtitle("Inhibitory neurons") +
+  xlab("Deconvoluted Proportion") +
+  ylab("AD Signature Expression") +
+  theme_minimal() + theme(legend.position = "none")
+ggsave("./output/in_scatter.png", plot = p, width = 3, height = 4, dpi = 300)
+```
+
+
+# additional 
+```{r}
+# try a different bulk 
+bulk <- read.csv("./data/weighted_bulk_cpm.csv", row.names = 1)
+bulk <- read.csv("./data/pseudobulk_cpm.csv", row.names = 1)
+ref <- read.csv("./data/reference.csv", row.names = 1)
+
+saveRDS(bulk, file = "./data/bulk.rds")
+saveRDS(ref, file = "./data/ref.rds")
+
+res <- readRDS("./output/bulk_pseudo_output.rds")
+prop <- as.data.frame(res$theta_n)
+prop_all <- process_sample_proportions(prop)
+prop_summed <- prop_all %>%
+  group_by(sample, cell_type) %>%
+  summarise(total_proportion = sum(proportion, na.rm = TRUE), .groups = "drop") %>% 
+  pivot_wider(names_from = cell_type, values_from = total_proportion)
+
+ggplot(prop_all, aes(x = cell_type, y = proportion, fill = reference)) +
+  geom_bar(stat = "identity") + scale_fill_viridis(discrete = TRUE) +
+  labs(
+    title = "Stacked Bar Plot of Reference Contribution by Cell Type",
+    x = "Cell Type",
+    y = "Proportion",
+    fill = "Reference"
+  ) +
+  theme_minimal()
+```
+
